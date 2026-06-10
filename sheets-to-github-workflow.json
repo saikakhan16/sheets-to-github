@@ -1,0 +1,268 @@
+{
+  "name": "Google Sheets → GitHub Auto Code Generator",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "node-schedule",
+      "name": "Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $env.GOOGLE_SHEET_ID }}/values/Sheet1!A1:Z1000",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GOOGLE_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-fetch-sheets",
+      "name": "Fetch Google Sheet Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Google Sheets data into structured JSON\nconst response = $input.first().json;\nconst rows = response.values || [];\n\nif (rows.length < 2) {\n  throw new Error('No data found in sheet. Make sure you have headers and at least one row.');\n}\n\n// First row is headers\nconst headers = rows[0];\nconst dataRows = rows.slice(1);\n\n// Convert to array of objects\nconst employees = dataRows.map(row => {\n  const obj = {};\n  headers.forEach((header, index) => {\n    obj[header] = row[index] || '';\n  });\n  return obj;\n});\n\n// Filter out empty rows\nconst validEmployees = employees.filter(e => e.Name && e.Name.trim() !== '');\n\nif (validEmployees.length === 0) {\n  throw new Error('No valid employee data found.');\n}\n\n// Build Claude prompt\nconst dataStr = JSON.stringify(validEmployees, null, 2);\n\nconst systemPrompt = `You are a senior frontend developer specializing in React and Tailwind CSS.\nGenerate a beautiful, production-ready React TypeScript component from the provided data.\nRules:\n- Output ONLY TSX code, no markdown fences, no explanations\n- Use Tailwind CSS for all styling\n- Make it responsive and visually appealing\n- Use semantic HTML\n- Export as: export const EmployeeDirectory = () => { ... }\n- End with: export default EmployeeDirectory;`;\n\nconst userPrompt = `Create a beautiful Employee Directory React component using this data:\n\n${dataStr}\n\nRequirements:\n- Show each employee as a card with avatar initials, name, role, email, department\n- Use a clean grid layout (3 columns on desktop, 1 on mobile)\n- Add department color badges\n- Professional look with subtle shadows and hover effects\n- Include a search/filter header`;\n\nreturn [{\n  json: {\n    employees: validEmployees,\n    totalCount: validEmployees.length,\n    systemPrompt,\n    userPrompt,\n    componentName: 'EmployeeDirectory',\n    filePath: 'src/components/generated/EmployeeDirectory.tsx',\n    timestamp: new Date().toISOString()\n  }\n}];\n"
+      },
+      "id": "node-parse-sheets",
+      "name": "Parse Sheet Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $env.ANTHROPIC_API_KEY }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 4096,\n  \"system\": {{ JSON.stringify($json.systemPrompt) }},\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify($json.userPrompt) }}\n    }\n  ]\n}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "node-claude",
+      "name": "Claude: Generate Component",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Claude response and prepare for GitHub\nconst claudeResponse = $input.first().json;\nconst sheetData = $('Parse Sheet Data').first().json;\n\nif (!claudeResponse.content || claudeResponse.content.length === 0) {\n  throw new Error('Claude returned empty response.');\n}\n\nlet generatedCode = claudeResponse.content[0].text || '';\n\n// Strip markdown fences if any\ngeneratedCode = generatedCode\n  .replace(/^```[\\w]*\\n?/gm, '')\n  .replace(/^```$/gm, '')\n  .trim();\n\nif (generatedCode.length < 100) {\n  throw new Error('Generated code is too short.');\n}\n\n// Base64 encode for GitHub API\nconst encoded = Buffer.from(generatedCode, 'utf-8').toString('base64');\n\nconst commitMessage = `feat: auto-generate EmployeeDirectory from Google Sheets\\n\\nTotal employees: ${sheetData.totalCount}\\nTimestamp: ${sheetData.timestamp}\\n\\n[skip ci]`;\n\nreturn [{\n  json: {\n    ...sheetData,\n    generatedCode,\n    encoded,\n    commitMessage,\n    codePreview: generatedCode.slice(0, 200)\n  }\n}];\n"
+      },
+      "id": "node-parse-claude",
+      "name": "Parse Claude Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $env.GITHUB_OWNER }}/{{ $env.GITHUB_REPO }}/contents/{{ $json.filePath }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GITHUB_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "node-check-file",
+      "name": "Check File Exists",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-exists",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 200,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "node-router",
+      "name": "File Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 400]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $env.GITHUB_OWNER }}/{{ $env.GITHUB_REPO }}/contents/{{ $('Parse Claude Response').first().json.filePath }}",
+        "method": "PUT",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GITHUB_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"message\": {{ JSON.stringify($('Parse Claude Response').first().json.commitMessage) }},\n  \"content\": {{ JSON.stringify($('Parse Claude Response').first().json.encoded) }},\n  \"sha\": \"{{ $json.body.sha }}\",\n  \"branch\": \"main\"\n}"
+      },
+      "id": "node-update",
+      "name": "GitHub: Update File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 280]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $env.GITHUB_OWNER }}/{{ $env.GITHUB_REPO }}/contents/{{ $('Parse Claude Response').first().json.filePath }}",
+        "method": "PUT",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GITHUB_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"message\": {{ JSON.stringify($('Parse Claude Response').first().json.commitMessage) }},\n  \"content\": {{ JSON.stringify($('Parse Claude Response').first().json.encoded) }},\n  \"branch\": \"main\"\n}"
+      },
+      "id": "node-create",
+      "name": "GitHub: Create File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const githubResult = $input.first().json;\nconst codeData = $('Parse Claude Response').first().json;\n\nconst commitUrl = githubResult.commit?.html_url ||\n  `https://github.com/${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}/blob/main/${codeData.filePath}`;\n\nconsole.log('✅ Success!');\nconsole.log('Component:', codeData.componentName);\nconsole.log('Employees:', codeData.totalCount);\nconsole.log('Commit:', commitUrl);\n\nreturn [{\n  json: {\n    success: true,\n    componentName: codeData.componentName,\n    totalEmployees: codeData.totalCount,\n    filePath: codeData.filePath,\n    commitUrl,\n    timestamp: codeData.timestamp\n  }\n}];\n"
+      },
+      "id": "node-success",
+      "name": "Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 400]
+    }
+  ],
+  "connections": {
+    "Every 15 Minutes": {
+      "main": [[{ "node": "Fetch Google Sheet Data", "type": "main", "index": 0 }]]
+    },
+    "Fetch Google Sheet Data": {
+      "main": [[{ "node": "Parse Sheet Data", "type": "main", "index": 0 }]]
+    },
+    "Parse Sheet Data": {
+      "main": [[{ "node": "Claude: Generate Component", "type": "main", "index": 0 }]]
+    },
+    "Claude: Generate Component": {
+      "main": [[{ "node": "Parse Claude Response", "type": "main", "index": 0 }]]
+    },
+    "Parse Claude Response": {
+      "main": [[{ "node": "Check File Exists", "type": "main", "index": 0 }]]
+    },
+    "Check File Exists": {
+      "main": [[{ "node": "File Exists?", "type": "main", "index": 0 }]]
+    },
+    "File Exists?": {
+      "main": [
+        [{ "node": "GitHub: Update File", "type": "main", "index": 0 }],
+        [{ "node": "GitHub: Create File", "type": "main", "index": 0 }]
+      ]
+    },
+    "GitHub: Update File": {
+      "main": [[{ "node": "Success", "type": "main", "index": 0 }]]
+    },
+    "GitHub: Create File": {
+      "main": [[{ "node": "Success", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "Asia/Kolkata"
+  },
+  "tags": ["google-sheets", "github", "claude", "automation"]
+}
